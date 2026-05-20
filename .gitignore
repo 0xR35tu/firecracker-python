@@ -187,3 +187,4 @@ firecracker-files/
 # Large downloaded files in project root
 *.squashfs*
 vmlinux-*
+firecracker/_version.py
