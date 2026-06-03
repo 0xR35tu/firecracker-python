@@ -497,6 +497,18 @@ class NetworkManager:
                     has_correct_dnat = False
 
                     for e in expr:
+                        # Current form: `fib daddr type local` (no host-IP match).
+                        if (
+                            "match" in e
+                            and e["match"]["op"] == "=="
+                            and "fib" in e["match"].get("left", {})
+                            and "daddr"
+                            in e["match"]["left"]["fib"].get("flags", [])
+                            and e["match"]["right"] == "local"
+                        ):
+                            has_daddr_match = True
+
+                        # Legacy form: exact `ip daddr <host_ip>` payload match.
                         if (
                             "match" in e
                             and e["match"]["op"] == "=="
@@ -684,6 +696,71 @@ class NetworkManager:
                 )
             return False
 
+    def _build_prerouting_rule(
+        self,
+        id: str,
+        family: str,
+        host_port: int,
+        dest_ip: str,
+        dest_port: int,
+        protocol: str = "tcp",
+    ):
+        """Build the PREROUTING DNAT rule for a port forward.
+
+        The destination-address match uses ``fib daddr type local`` instead of a
+        single detected host IP. This matches any address the host owns, on every
+        provider, with zero host-IP detection -- fixing the ``ip daddr 0.0.0.0``
+        bug where a failed/empty public-IP lookup produced a rule that never fired.
+
+        Args:
+            id (str): Machine ID, used in the rule comment.
+            family (str): nftables family ("ip" or "ip6").
+            host_port (int): Host port to forward.
+            dest_ip (str): IP address to forward to.
+            dest_port (int): Port to forward to.
+            protocol (str): Protocol to forward (default: "tcp").
+
+        Returns:
+            dict: An nftables ``add`` rule object for the PREROUTING chain.
+        """
+        return {
+            "add": {
+                "rule": {
+                    "family": family,
+                    "table": "nat",
+                    "chain": "PREROUTING",
+                    "comment": f"machine_id={id} host_port={host_port} vm_port={dest_port}",
+                    "expr": [
+                        {
+                            "match": {
+                                "op": "==",
+                                "left": {
+                                    "fib": {
+                                        "result": "type",
+                                        "flags": ["daddr"],
+                                    }
+                                },
+                                "right": "local",
+                            }
+                        },
+                        {
+                            "match": {
+                                "op": "==",
+                                "left": {
+                                    "payload": {
+                                        "protocol": protocol,
+                                        "field": "dport",
+                                    }
+                                },
+                                "right": host_port,
+                            }
+                        },
+                        {"dnat": {"addr": dest_ip, "port": dest_port}},
+                    ],
+                }
+            }
+        }
+
     def add_port_forward(
         self,
         id: str,
@@ -695,8 +772,13 @@ class NetworkManager:
     ):
         """Port forward a port to a new IP and port.
 
+        The PREROUTING rule matches ``fib daddr type local`` (any address the host
+        owns), so ``host_ip`` is used only to detect the IP family (IPv4 vs IPv6);
+        its value no longer appears in the rule match. This avoids the
+        ``ip daddr 0.0.0.0`` bug on hosts where public-IP detection fails.
+
         Args:
-            host_ip (str): IP address to forward from.
+            host_ip (str): IP address used only to detect IPv4/IPv6 family.
             host_port (int): Port to forward.
             dest_ip (str): IP address to forward to.
             dest_port (int): Port to forward to.
@@ -767,45 +849,11 @@ class NetworkManager:
                 }
             )
 
-        # Add PREROUTING rule
+        # Add PREROUTING rule (fib daddr type local -- no host-IP detection)
         rules["nftables"].append(
-            {
-                "add": {
-                    "rule": {
-                        "family": family,
-                        "table": "nat",
-                        "chain": "PREROUTING",
-                        "comment": f"machine_id={id} host_port={host_port} vm_port={dest_port}",
-                        "expr": [
-                            {
-                                "match": {
-                                    "op": "==",
-                                    "left": {
-                                        "payload": {
-                                            "protocol": family,
-                                            "field": "daddr",
-                                        }
-                                    },
-                                    "right": host_ip,
-                                }
-                            },
-                            {
-                                "match": {
-                                    "op": "==",
-                                    "left": {
-                                        "payload": {
-                                            "protocol": protocol,
-                                            "field": "dport",
-                                        }
-                                    },
-                                    "right": host_port,
-                                }
-                            },
-                            {"dnat": {"addr": dest_ip, "port": dest_port}},
-                        ],
-                    }
-                }
-            }
+            self._build_prerouting_rule(
+                id, family, host_port, dest_ip, dest_port, protocol
+            )
         )
 
         # Only add POSTROUTING rule if it doesn't already exist

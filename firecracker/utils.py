@@ -2,6 +2,7 @@ import os
 import random
 import string
 import signal
+import ipaddress
 import requests
 import subprocess
 import socket
@@ -185,8 +186,20 @@ def get_public_ip(timeout: int = 5):
 
     for url in URLS:
         try:
-            return _try_get_ip_from_url(url, timeout)
+            ip = _try_get_ip_from_url(url, timeout)
         except requests.RequestException:
             continue
+
+        # Reject empty/garbage and unspecified (0.0.0.0 / ::) responses so a bad
+        # service can never silently produce a dead "daddr 0.0.0.0" forward rule.
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+
+        if ip_obj.is_unspecified:
+            continue
+
+        return str(ip_obj)
 
     raise RuntimeError("Failed to get public IP")
