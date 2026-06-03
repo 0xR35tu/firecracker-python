@@ -167,3 +167,51 @@ class TestUtilsFunctions:
 
         with pytest.raises(RuntimeError, match="VMM ID required"):
             test_func(None)
+
+
+class TestGetPublicIP:
+    """Tests for get_public_ip validation (never yield 0.0.0.0/empty)."""
+
+    def test_returns_valid_ip(self):
+        """A valid IP from the first service is returned."""
+        from unittest.mock import patch
+        from firecracker.utils import get_public_ip
+
+        with patch(
+            "firecracker.utils._try_get_ip_from_url", return_value="138.201.226.62"
+        ):
+            assert get_public_ip() == "138.201.226.62"
+
+    def test_skips_unspecified_then_returns_valid(self):
+        """0.0.0.0 from one service is skipped; next valid IP wins."""
+        from unittest.mock import patch
+        from firecracker.utils import get_public_ip
+
+        with patch(
+            "firecracker.utils._try_get_ip_from_url",
+            side_effect=["0.0.0.0", "203.0.113.5", "203.0.113.9"],
+        ):
+            assert get_public_ip() == "203.0.113.5"
+
+    def test_skips_empty_and_garbage(self):
+        """Empty/garbage responses are skipped, not returned."""
+        from unittest.mock import patch
+        from firecracker.utils import get_public_ip
+
+        with patch(
+            "firecracker.utils._try_get_ip_from_url",
+            side_effect=["", "not-an-ip", "203.0.113.7"],
+        ):
+            assert get_public_ip() == "203.0.113.7"
+
+    def test_raises_when_all_unspecified_or_invalid(self):
+        """All services returning 0.0.0.0/garbage -> RuntimeError, never 0.0.0.0."""
+        from unittest.mock import patch
+        from firecracker.utils import get_public_ip
+
+        with patch(
+            "firecracker.utils._try_get_ip_from_url",
+            side_effect=["0.0.0.0", "", "::"],
+        ):
+            with pytest.raises(RuntimeError, match="Failed to get public IP"):
+                get_public_ip()

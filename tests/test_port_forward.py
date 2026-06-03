@@ -2,10 +2,77 @@
 
 import json
 import os
+from unittest.mock import patch
 
 import pytest
 
 from firecracker import MicroVM
+from firecracker.network import NetworkManager
+
+
+class TestPreroutingRuleBuild:
+    """Unit tests for the PREROUTING DNAT rule builder (no nftables/KVM needed).
+
+    Guards the `ip daddr 0.0.0.0` regression: the rule must match
+    `fib daddr type local`, never an exact host-IP daddr payload.
+    """
+
+    def _build(self, **kwargs):
+        with patch("firecracker.network.IPRoute"):
+            nm = NetworkManager()
+        defaults = dict(
+            id="9fngkuf7",
+            family="ip",
+            host_port=37699,
+            dest_ip="172.115.48.209",
+            dest_port=22,
+            protocol="tcp",
+        )
+        defaults.update(kwargs)
+        return nm._build_prerouting_rule(**defaults)
+
+    def test_uses_fib_daddr_type_local(self):
+        """Rule matches any local address via fib, not a single host IP."""
+        expr = self._build()["add"]["rule"]["expr"]
+        fib_matches = [
+            e
+            for e in expr
+            if "match" in e and "fib" in e["match"].get("left", {})
+        ]
+        assert len(fib_matches) == 1
+        m = fib_matches[0]["match"]
+        assert m["op"] == "=="
+        assert m["left"]["fib"]["result"] == "type"
+        assert "daddr" in m["left"]["fib"]["flags"]
+        assert m["right"] == "local"
+
+    def test_no_exact_daddr_payload_match(self):
+        """Regression: no `ip daddr <addr>` payload match remains in the rule."""
+        expr = self._build()["add"]["rule"]["expr"]
+        for e in expr:
+            left = e.get("match", {}).get("left", {})
+            if "payload" in left:
+                assert left["payload"]["field"] != "daddr"
+
+    def test_dport_and_dnat_preserved(self):
+        """dport match and dnat target unchanged."""
+        expr = self._build()["add"]["rule"]["expr"]
+        dport = next(
+            e["match"]
+            for e in expr
+            if "match" in e
+            and e["match"]["left"].get("payload", {}).get("field") == "dport"
+        )
+        assert dport["right"] == 37699
+        dnat = next(e["dnat"] for e in expr if "dnat" in e)
+        assert dnat == {"addr": "172.115.48.209", "port": 22}
+
+    def test_comment_format_unchanged(self):
+        """Comment key is unchanged -- deletion/idempotency paths depend on it."""
+        rule = self._build()["add"]["rule"]
+        assert rule["comment"] == "machine_id=9fngkuf7 host_port=37699 vm_port=22"
+        assert rule["chain"] == "PREROUTING"
+        assert rule["table"] == "nat"
 
 KERNEL_FILE = "/var/lib/firecracker/vmlinux-6.1.159"
 BASE_ROOTFS = "/var/lib/firecracker/devsecops-box.img"
