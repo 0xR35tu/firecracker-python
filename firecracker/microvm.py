@@ -1541,6 +1541,8 @@ class MicroVM:
         container_name = image.split("/")[-1].replace(":", "-")
         tar_file = f"{self._config.data_path}/rootfs_{container_name}.tar"
 
+        container = None
+        merged_dir = None
         try:
             if not image:
                 raise VMMError(f"Failed to download Docker image {image}")
@@ -1549,6 +1551,21 @@ class MicroVM:
                 self._logger.debug(f"Creating container: {container_name}")
 
             container = self._docker.containers.create(image, name=container_name)
+
+            # container.export() makes the daemon mount the container's overlay
+            # rootfs (overlay2/<id>/merged), and container.remove() does not
+            # unmount it. The orphaned mount pins the image layers, so a later
+            # `docker image prune` reclaims 0B and disk fills up over repeated
+            # builds. Capture the merged path now (populated at create time) so
+            # we can unmount it explicitly in the finally block below.
+            try:
+                graph = self._docker.api.inspect_container(
+                    container.id
+                ).get("GraphDriver", {})
+                merged_dir = graph.get("Data", {}).get("MergedDir")
+            except Exception:
+                merged_dir = None
+
             export_data = container.export()
 
             if self._config.verbose:
@@ -1557,8 +1574,6 @@ class MicroVM:
             with open(tar_file, "wb") as f:
                 for chunk in export_data:
                     f.write(chunk)
-
-            container.remove(force=True)
 
             if self._config.verbose:
                 self._logger.debug(f"Successfully exported container to {tar_file}")
@@ -1569,6 +1584,23 @@ class MicroVM:
             raise VMMError(f"Docker error: {e}")
         except Exception as e:
             raise VMMError(f"Unexpected error: {e}")
+        finally:
+            # Remove the container, then ensure its overlay rootfs is unmounted
+            # so the image layers can actually be pruned/reclaimed afterwards.
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                except Exception as e:
+                    if self._config.verbose:
+                        self._logger.debug(
+                            f"Failed to remove container {container_name}: {e}"
+                        )
+            if merged_dir and os.path.ismount(merged_dir):
+                # Plain unmount first; lazy unmount if briefly busy after teardown.
+                if run(f"umount {merged_dir}").returncode != 0:
+                    run(f"umount -l {merged_dir}")
+                if self._config.verbose:
+                    self._logger.debug(f"Unmounted leaked overlay: {merged_dir}")
 
     def _build_rootfs(self, image: str, file: str, size: str, fs_format: str = "ext4"):
         """Create a filesystem image from a tar file.
