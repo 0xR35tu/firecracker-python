@@ -1,5 +1,5 @@
 FROM ubuntu:24.04
-LABEL maintainer="Muhammad Yuga Nugraha"
+LABEL maintainer="PDSO Platform"
 
 COPY id_rsa.pub /root/.ssh/authorized_keys
 COPY init /usr/local/bin/init

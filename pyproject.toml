@@ -7,7 +7,7 @@ name = "hysn-firecracker-python"
 dynamic = ["version"]
 description = "A Python client library to interact with Firecracker microVMs"
 authors = [
-    {name = "Muhammad Yuga Nugraha"}
+    {name = "PDSO Platform"}
 ]
 requires-python = ">=3.9"
 dependencies = [

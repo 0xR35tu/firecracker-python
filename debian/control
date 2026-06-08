@@ -1,7 +1,7 @@
 Source: firecracker-python
 Section: python
 Priority: optional
-Maintainer: Muhammad Yuga Nugraha <myugan59@gmail.com>
+Maintainer: PDSO Platform
 Standards-Version: 4.6.2
 Build-Depends: debhelper (>= 11), dh-python, python3-all, python3-setuptools, curl, jq
 

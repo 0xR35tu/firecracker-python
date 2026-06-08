@@ -4,7 +4,7 @@ from setuptools import setup
 setup(
     name="hysn-firecracker-python",
     description="A Python client library to interact with Firecracker microVMs",
-    author="Muhammad Yuga Nugraha",
+    author="PDSO Platform",
     packages=find_packages(),
     install_requires=[
         "requests==2.32.3",

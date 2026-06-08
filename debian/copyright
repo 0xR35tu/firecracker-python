@@ -1,10 +1,10 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: firecracker-python
-Upstream-Contact: Muhammad Yuga Nugraha <myugan59@gmail.com>
+Upstream-Contact: PDSO Platform
 Source: https://github.com/myugan/firecracker-python
 
 Files: *
-Copyright: 2025 Muhammad Yuga Nugraha <myugan59@gmail.com>
+Copyright: 2025 PDSO Platform
 License: MIT
 
 License: MIT
