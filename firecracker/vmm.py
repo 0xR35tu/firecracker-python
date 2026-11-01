@@ -10,6 +10,8 @@ from firecracker.process import ProcessManager
 from firecracker.utils import requires_id
 from firecracker.exceptions import VMMError
 
+VMM_ID_PATTERN = re.compile(r"^[a-zA-Z0-9]{8}$")
+
 
 class VMMManager:
     """Manages Virtual Machine Monitor (VMM) instances.
@@ -28,6 +30,10 @@ class VMMManager:
         self._network = NetworkManager(verbose=verbose, level=level)
         self._process = ProcessManager(verbose=verbose, level=level)
         self._api = None
+
+    def close(self):
+        """Release the network handles this manager holds."""
+        self._network.close()
 
     def get_api(self, id: str, timeout: int = 5) -> Api:
         """Get an API instance for a given VMM ID.
@@ -99,8 +105,6 @@ class VMMManager:
         running_pids = set(self._process.get_pids())
         has_running_vmms = bool(running_pids)
 
-        vmm_id_pattern = re.compile(r"^[a-zA-Z0-9]{8}$")
-
         data_path = self._config.data_path
 
         try:
@@ -112,7 +116,7 @@ class VMMManager:
 
         for vmm_id in vmm_dirs:
             # Early validation - skip non-matching IDs
-            if not vmm_id_pattern.match(vmm_id):
+            if not VMM_ID_PATTERN.match(vmm_id):
                 continue
 
             vmm_path = os.path.join(data_path, vmm_id)
@@ -474,14 +478,28 @@ class VMMManager:
         except Exception as e:
             raise VMMError(f"Error during VMM deletion: {str(e)}")
 
-    def cleanup(self, id=None):
-        """Clean up network and process resources for a VMM.
-        
+    def cleanup(self, id=None, delete_masquerade: bool = True) -> List[str]:
+        """Clean up process, directory and network resources for a VMM.
+
         Uses best-effort approach: each cleanup step runs independently,
         and failures in one step don't prevent cleanup of other resources.
+        A resource that is already gone counts as cleaned up, so this also
+        works for a VMM whose process died.
+
+        The directory is the largest item, so it is removed right after the
+        process stops. If the caller crashes later in this method, only
+        small network leftovers remain.
+
+        Args:
+            id (str): ID of the VMM to clean up
+            delete_masquerade (bool): Also delete the shared masquerade rule
+                that other running VMMs use for outbound traffic.
+
+        Returns:
+            List[str]: Errors from the steps that failed. Empty on success.
         """
         cleanup_errors = []
-        
+
         # Stop process (best effort)
         try:
             self._process.stop(id)
@@ -489,15 +507,7 @@ class VMMManager:
             cleanup_errors.append(f"Process cleanup failed: {str(e)}")
             if self._config.verbose:
                 self._logger.warn(f"Failed to stop process for {id}: {e}")
-        
-        # Cleanup network (best effort)
-        try:
-            self._network.cleanup(f"tap_{id}")
-        except Exception as e:
-            cleanup_errors.append(f"Network cleanup failed: {str(e)}")
-            if self._config.verbose:
-                self._logger.warn(f"Failed to cleanup network for {id}: {e}")
-        
+
         # Delete directory (best effort)
         try:
             self.delete_vmm_dir(id)
@@ -505,10 +515,24 @@ class VMMManager:
             cleanup_errors.append(f"Directory cleanup failed: {str(e)}")
             if self._config.verbose:
                 self._logger.warn(f"Failed to delete directory for {id}: {e}")
-        
+
+        # Cleanup network (best effort)
+        try:
+            network_errors = self._network.cleanup(
+                f"tap_{id}", delete_masquerade=delete_masquerade
+            )
+            for error in network_errors or []:
+                cleanup_errors.append(f"Network cleanup failed: {error}")
+        except Exception as e:
+            cleanup_errors.append(f"Network cleanup failed: {str(e)}")
+            if self._config.verbose:
+                self._logger.warn(f"Failed to cleanup network for {id}: {e}")
+
         # Report if cleanup had issues
         if cleanup_errors:
             self._logger.error(f"Cleanup errors for {id}: {'; '.join(cleanup_errors)}")
+
+        return cleanup_errors
 
     def cleanup_orphaned_resources(self):
         """Clean up resources from VMs that failed during creation.

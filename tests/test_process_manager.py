@@ -147,9 +147,10 @@ class TestProcessManager:
                 f.write("12345")
 
             with patch.object(manager._config, "data_path", tmpdir):
-                with patch.object(manager, "_try_stop_process", return_value=True):
-                    result = manager.stop(vmm_id)
-                    assert result is True
+                with patch.object(manager, "_is_vm_process", return_value=True):
+                    with patch.object(manager, "_try_stop_process", return_value=True):
+                        result = manager.stop(vmm_id)
+                        assert result is True
 
     def test_stop_nonexistent_process(self):
         """Test stopping a non-existent process."""
@@ -178,17 +179,18 @@ class TestProcessManager:
                 f.write("12345")
 
             with patch.object(manager._config, "data_path", tmpdir):
-                with patch.object(
-                    manager,
-                    "_try_stop_process",
-                    side_effect=[ProcessError("Not found"), True],
-                ):
+                with patch.object(manager, "_is_vm_process", return_value=True):
                     with patch.object(
-                        manager, "_find_running_process", return_value=54321
+                        manager,
+                        "_try_stop_process",
+                        side_effect=[ProcessError("Not found"), True],
                     ):
-                        with patch.object(manager, "_cleanup_files"):
-                            result = manager.stop(vmm_id)
-                            assert result is True
+                        with patch.object(
+                            manager, "_find_running_process", return_value=54321
+                        ):
+                            with patch.object(manager, "_cleanup_files"):
+                                result = manager.stop(vmm_id)
+                                assert result is True
 
     def test_is_running_true(self):
         """Test checking if process is running (true)."""

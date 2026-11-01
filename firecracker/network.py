@@ -34,7 +34,9 @@ class NetworkManager:
         else:
             self._nft = None
 
-        self._ipr = IPRoute()
+        # IPRoute is opened per call and closed at once. pyroute2 0.8.1 leaks
+        # two pipes for every IPRoute that is not closed, and garbage
+        # collection does not free them.
         self._logger = Logger(level=level, verbose=verbose)
 
     def get_interface_name(self) -> str:
@@ -108,34 +110,44 @@ class NetworkManager:
             list: List of matching rules for the specified tap interface.
         """
         tap_rules = []
-        logged_tap_names = set()
+        seen_handles = set()
 
         for item in rules:
             if "rule" in item:
                 rule = item["rule"]
                 if "expr" in rule:
                     for expr in rule["expr"]:
+                        # Exact match only: tap_abc must not match tap_abcd.
                         if (
                             "match" in expr
-                            and "right" in expr["match"]
-                            and isinstance(expr["match"]["right"], str)
-                            and tap_name in expr["match"]["right"]
+                            and expr["match"].get("right") == tap_name
+                            and rule["handle"] not in seen_handles
                         ):
                             if self._config.verbose:
-                                if tap_name not in logged_tap_names:
-                                    self._logger.debug(
-                                        f"Found matching rule for {tap_name} with handle {rule['handle']}"
-                                    )
-                                    logged_tap_names.add(tap_name)
+                                self._logger.debug(
+                                    f"Found matching rule for {tap_name} with handle {rule['handle']}"
+                                )
+                            seen_handles.add(rule["handle"])
                             tap_rules.append(
                                 {
+                                    "family": rule.get("family", "ip"),
+                                    "table": rule.get("table", "filter"),
                                     "handle": rule["handle"],
                                     "chain": rule["chain"],
-                                    "interface": expr["match"]["right"],
+                                    "interface": tap_name,
                                 }
                             )
 
         return tap_rules
+
+    def get_links(self) -> list:
+        """List all network interfaces using pyroute2.
+
+        Returns:
+            list: Link messages, one for each interface.
+        """
+        with IPRoute() as ipr:
+            return ipr.get_links()
 
     def check_tap_device(self, tap_device_name: str) -> bool:
         """Check if the tap device exists in the system using pyroute2.
@@ -150,7 +162,8 @@ class NetworkManager:
             NetworkError: If checking the tap device fails.
         """
         try:
-            links = self._ipr.link_lookup(ifname=tap_device_name)
+            with IPRoute() as ipr:
+                links = ipr.link_lookup(ifname=tap_device_name)
             if not bool(links):
                 return False
             else:
@@ -322,8 +335,42 @@ class NetworkManager:
         except Exception as e:
             raise NetworkError(f"Failed to add NAT forwarding rule: {str(e)}")
 
+    def list_table(self, family: str, table: str):
+        """List all items of one nftables table.
+
+        Args:
+            family (str): Table family, for example "ip".
+            table (str): Table name, for example "nat" or "filter".
+
+        Returns:
+            list: Items of the table. Empty if nftables is not available or
+                the table does not exist.
+
+        Raises:
+            NetworkError: If listing the table fails.
+        """
+        try:
+            cmd = {"nftables": [{"list": {"table": {"family": family, "name": table}}}]}
+            rc, output, error = self._safe_nft_cmd(cmd)
+
+            if rc is None:  # Nftables not available
+                return []
+
+            if rc != 0:
+                if "No such file or directory" in str(error):
+                    return []
+                raise NetworkError(f"Failed to list table {family} {table}: {error}")
+
+            if output and "nftables" in output:
+                return output["nftables"]
+            else:
+                return []
+
+        except Exception as e:
+            raise NetworkError(f"Failed to list table {family} {table}: {str(e)}")
+
     def get_nat_rules(self):
-        """Get all NAT rules from nftables.
+        """Get all rules from the ip nat table.
 
         Returns:
             list: List of NAT rules.
@@ -332,22 +379,25 @@ class NetworkManager:
             NetworkError: If getting NAT rules fails.
         """
         try:
-            rule = {"nftables": [{"list": {"table": {"family": "ip", "name": "nat"}}}]}
-            rc, output, error = self._safe_nft_cmd(rule)
-
-            if rc is None:  # Nftables not available
-                return []
-
-            if rc != 0:
-                raise NetworkError(f"Failed to get NAT rules: {error}")
-
-            if output and "nftables" in output:
-                return output["nftables"]
-            else:
-                return []
-
+            return self.list_table("ip", "nat")
         except Exception as e:
             raise NetworkError(f"Failed to get NAT rules: {str(e)}")
+
+    def get_filter_rules(self):
+        """Get all rules from the ip filter table.
+
+        The per-tap FORWARD rules that add_nat_rules() creates live here.
+
+        Returns:
+            list: List of filter rules.
+
+        Raises:
+            NetworkError: If getting filter rules fails.
+        """
+        try:
+            return self.list_table("ip", "filter")
+        except Exception as e:
+            raise NetworkError(f"Failed to get filter rules: {str(e)}")
 
     def get_masquerade_handle(self):
         """
@@ -359,6 +409,9 @@ class NetworkManager:
         Returns:
             int: The handle value if found, None otherwise.
         """
+        if self._nft is None:  # Nftables not available
+            return None
+
         list_cmd = {"nftables": [{"list": {"table": {"family": "ip", "name": "nat"}}}]}
         output = self._nft.json_cmd(list_cmd)
 
@@ -925,7 +978,10 @@ class NetworkManager:
         Raises:
             NetworkError: If deleting the rule fails.
         """
-        cmd = f"delete rule filter {rule['chain']} handle {rule['handle']}"
+        cmd = (
+            f"delete rule {rule.get('family', 'ip')} {rule.get('table', 'filter')} "
+            f"{rule['chain']} handle {rule['handle']}"
+        )
         rc, output, error = self._nft.cmd(cmd)
 
         try:
@@ -943,22 +999,35 @@ class NetworkManager:
             raise NetworkError(f"Failed to delete rule: {str(e)}")
 
     def delete_nat_rules(self, tap_name):
-        """Delete all nftables rules associated with the specified tap interface.
+        """Delete all nftables rules that name the specified tap interface.
+
+        add_nat_rules() puts the FORWARD rules in the ip filter table. This
+        searches the ip nat and ip filter tables. Any other rule there that
+        names the tap is deleted too.
 
         Args:
             tap_name (str): Name of the tap device to delete rules for.
+
+        Returns:
+            list: Handles of the rules that could not be deleted. Empty on
+                success.
         """
         try:
-            rules = self.get_nat_rules()
+            rules = self.get_nat_rules() + self.get_filter_rules()
             tap_rules = self.find_tap_interface_rules(rules, tap_name)
             if self._config.verbose:
                 self._logger.debug(f"Found {len(tap_rules)} rules for {tap_name}")
 
+            failed = []
             for rule in tap_rules:
-                self.delete_rule(rule)
+                if not self.delete_rule(rule):
+                    failed.append(str(rule["handle"]))
+                    continue
                 if self._config.verbose:
                     self._logger.debug(f"Deleted rule with handle {rule['handle']}")
                     self._logger.info("Deleted NAT rules")
+
+            return failed
 
         except Exception as e:
             raise NetworkError(f"Failed to delete NAT rules: {str(e)}")
@@ -1063,6 +1132,9 @@ class NetworkManager:
         Raises:
             NetworkError: If deleting port forwarding rules fails.
         """
+        if self._nft is None:  # Nftables not available, so no rules exist
+            return
+
         list_cmd = {"nftables": [{"list": {"table": {"family": "ip", "name": "nat"}}}]}
 
         try:
@@ -1131,30 +1203,27 @@ class NetworkManager:
         try:
             new_network = IPv4Network(f"{ip_addr}/{prefix_len}", strict=False)
 
-            ifaces = self._ipr.get_links()
+            with IPRoute() as ipr:
+                addresses = ipr.get_addr()
 
-            for iface in ifaces:
-                idx = iface["index"]
-                addresses = self._ipr.get_addr(index=idx)
+            for addr in addresses:
+                for attr_name, attr_value in addr.get("attrs", []):
+                    if attr_name == "IFA_ADDRESS":
+                        if ":" in attr_value:
+                            continue
 
-                for addr in addresses:
-                    for attr_name, attr_value in addr.get("attrs", []):
-                        if attr_name == "IFA_ADDRESS":
-                            if ":" in attr_value:
-                                continue
+                        existing_prefix = addr.get("prefixlen", 24)
+                        existing_network = IPv4Network(
+                            f"{attr_value}/{existing_prefix}", strict=False
+                        )
 
-                            existing_prefix = addr.get("prefixlen", 24)
-                            existing_network = IPv4Network(
-                                f"{attr_value}/{existing_prefix}", strict=False
-                            )
-
-                            if new_network.overlaps(existing_network):
-                                if self._config.verbose:
-                                    self._logger.warn(
-                                        f"CIDR conflict detected: {new_network} "
-                                        f"overlaps with existing {existing_network}"
-                                    )
-                                return False
+                        if new_network.overlaps(existing_network):
+                            if self._config.verbose:
+                                self._logger.warn(
+                                    f"CIDR conflict detected: {new_network} "
+                                    f"overlaps with existing {existing_network}"
+                                )
+                            return False
             return True
 
         except (AddressValueError, ValueError) as e:
@@ -1197,15 +1266,12 @@ class NetworkManager:
             raise NetworkError(f"Failed to suggest non-conflicting IP: {str(e)}")
 
     def close(self):
-        """Close network manager resources and release file descriptors."""
-        try:
-            if self._nft:
-                self._nft = None
-            if self._ipr:
-                self._ipr.close()
-                self._ipr = None
-        except Exception:
-            pass
+        """Close network manager resources.
+
+        IPRoute handles are opened and closed per call, so only the nftables
+        context is left to drop.
+        """
+        self._nft = None
 
     def create_tap(
         self, tap_name: str = None, iface_name: str = None, gateway_ip: str = None
@@ -1229,12 +1295,13 @@ class NetworkManager:
                 raise ValueError("Interface name must not exceed 16 characters")
 
         try:
-            self._ipr.link("add", ifname=tap_name, kind="tuntap", mode="tap")
-            idx = self._ipr.link_lookup(ifname=tap_name)[0]
-            if gateway_ip:
-                self._ipr.addr("add", index=idx, address=gateway_ip, prefixlen=24)
+            with IPRoute() as ipr:
+                ipr.link("add", ifname=tap_name, kind="tuntap", mode="tap")
+                idx = ipr.link_lookup(ifname=tap_name)[0]
+                if gateway_ip:
+                    ipr.addr("add", index=idx, address=gateway_ip, prefixlen=24)
 
-            self._ipr.link("set", index=idx, state="up")
+                ipr.link("set", index=idx, state="up")
 
             if self._config.verbose:
                 self._logger.debug(f"Created TAP device {tap_name}")
@@ -1250,9 +1317,11 @@ class NetworkManager:
             name (str): Name of the tap device to clean up.
         """
         try:
-            if self.check_tap_device(name):
-                idx = self._ipr.link_lookup(ifname=name)[0]
-                self._ipr.link("del", index=idx)
+            with IPRoute() as ipr:
+                idx = ipr.link_lookup(ifname=name)
+                if idx:
+                    ipr.link("del", index=idx[0])
+            if idx:
                 if self._config.verbose:
                     self._logger.info(f"Removed tap device {name}")
             return True
@@ -1270,7 +1339,7 @@ class NetworkManager:
             running_vm_ids (set): Set of VM IDs that are currently running
         """
         try:
-            links = self._ipr.get_links()
+            links = self.get_links()
             cleaned_count = 0
             
             for link in links:
@@ -1310,7 +1379,7 @@ class NetworkManager:
         except Exception as e:
             self._logger.error(f"Failed to cleanup orphaned TAP devices: {e}")
 
-    def cleanup(self, tap_device: str):
+    def cleanup(self, tap_device: str, delete_masquerade: bool = True):
         """Clean up network resources including TAP device and firewall rules.
         
         Uses best-effort approach: each cleanup step runs independently,
@@ -1318,13 +1387,22 @@ class NetworkManager:
 
         Args:
             tap_device (str): Name of the tap device to clean up.
+            delete_masquerade (bool): Also delete the shared masquerade rule.
+                Other running VMs use that rule for outbound traffic.
+
+        Returns:
+            list: Errors from the steps that failed. Empty on success.
         """
         cleanup_errors = []
         
         # Step 1: Delete NAT rules (best effort)
         try:
-            self.delete_nat_rules(tap_device)
-            if self._config.verbose:
+            failed = self.delete_nat_rules(tap_device)
+            if failed:
+                cleanup_errors.append(
+                    f"Failed to delete NAT rules: handles {', '.join(failed)}"
+                )
+            elif self._config.verbose:
                 self._logger.debug(f"Deleted NAT rules for {tap_device}")
         except Exception as e:
             cleanup_errors.append(f"Failed to delete NAT rules: {str(e)}")
@@ -1332,14 +1410,15 @@ class NetworkManager:
                 self._logger.warn(f"Failed to delete NAT rules for {tap_device}: {e}")
         
         # Step 2: Delete masquerade (best effort)
-        try:
-            self.delete_masquerade()
-            if self._config.verbose:
-                self._logger.debug("Deleted masquerade rule")
-        except Exception as e:
-            cleanup_errors.append(f"Failed to delete masquerade: {str(e)}")
-            if self._config.verbose:
-                self._logger.warn(f"Failed to delete masquerade: {e}")
+        if delete_masquerade:
+            try:
+                self.delete_masquerade()
+                if self._config.verbose:
+                    self._logger.debug("Deleted masquerade rule")
+            except Exception as e:
+                cleanup_errors.append(f"Failed to delete masquerade: {str(e)}")
+                if self._config.verbose:
+                    self._logger.warn(f"Failed to delete masquerade: {e}")
         
         # Step 3: Delete port forwarding (best effort)
         try:
@@ -1367,3 +1446,5 @@ class NetworkManager:
             error_msg = f"Partial cleanup for {tap_device}: {'; '.join(cleanup_errors)}"
             if self._config.verbose:
                 self._logger.warn(error_msg)
+
+        return cleanup_errors

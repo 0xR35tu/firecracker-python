@@ -10,12 +10,18 @@ For a VM with the ID `abcd1234`, `delete()` removes:
 |---|---|
 | Firecracker process | the Firecracker process of the VM |
 | TAP device | `tap_abcd1234` |
-| nftables rules for the TAP device | rules in the `ip nat` and `ip filter` tables |
+| nftables rules for the TAP device | rules in the `ip nat` and `ip filter` tables that name `tap_abcd1234` exactly. Rules that other programs added for this TAP device are removed too. |
 | Port forwards | rules with the comment `machine_id=abcd1234 ...` |
 | Masquerade rule | the shared `microVM outbound NAT` rule. See [Known issues](#known-issues). |
 | VM directory | `/var/lib/firecracker/abcd1234/`, including the rootfs copy and the logs |
 
 The TAP device name always uses the random VM ID, not the VM `name`.
+
+`delete()` removes the resources in this order:
+
+1. The Firecracker process.
+2. The VM directory. This is the largest item, so it goes early.
+3. The network resources.
 
 Each step runs even if an earlier step fails. Failures are logged together at the end:
 
@@ -52,6 +58,29 @@ MicroVM().delete(all=True)
 | `"All VMMs and orphaned resources are deleted"` | `all=True` finished. |
 | `"VMM with ID abcd1234 not found"` | No running VM has this ID. |
 | `"No VMMs available to delete"` | No VM runs. Nothing was cleaned, also with `all=True`. |
+
+## Delete a VM whose process is dead
+
+Use `force=True` to clean up a VM after its Firecracker process crashed:
+
+```python
+MicroVM().delete(id="abcd1234", force=True)
+```
+
+Without `force`, `delete()` only finds VMs whose process runs. For a dead VM, it returns `"VMM with ID abcd1234 not found"` and removes nothing.
+
+With `force=True`, `delete()` does these things:
+
+- It runs every cleanup step, whatever the state of the process.
+- It counts a resource that is already gone as removed. You can run it again safely.
+- It raises `VMMError` if a step fails. It does not return an error string.
+- It keeps the shared `microVM outbound NAT` rule, so other VMs keep their outbound traffic.
+- It returns `"VMM abcd1234 is deleted"` also for an ID that has nothing left to clean up.
+- It raises `VMMError` if the ID is not 8 letters or digits.
+
+`force=True` works on one VM only. It raises `ValueError` together with `all=True`.
+
+Before the library stops a process, it checks the process command line for `--id abcd1234`. Linux reuses process IDs. So the PID file of a VM that died long ago can name an unrelated process. The library never stops that process.
 
 ## Orphaned resources
 

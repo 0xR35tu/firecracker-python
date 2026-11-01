@@ -2,6 +2,7 @@ import os
 import time
 import psutil
 import subprocess
+from typing import Optional
 from datetime import datetime
 from firecracker.logger import Logger
 from firecracker.config import MicroVMConfig
@@ -13,6 +14,24 @@ from tenacity import (
     retry_if_exception_type,
     stop_after_attempt,
 )
+
+
+def is_vm_process(pid, vmm_id: str) -> bool:
+    """Return True only if pid is the Firecracker process for vmm_id.
+
+    A PID alone isn't enough: Linux recycles PIDs, so after a reboot or a
+    crash the same number can belong to an unrelated process. start() always
+    runs Firecracker with ``--id <vmm_id>``, so that flag in the process's
+    own command line proves which VM it belongs to.
+    """
+    try:
+        cmdline = psutil.Process(int(pid)).cmdline()
+    except (TypeError, ValueError, psutil.Error):
+        return False
+    return any(
+        arg == "--id" and i + 1 < len(cmdline) and cmdline[i + 1] == vmm_id
+        for i, arg in enumerate(cmdline)
+    )
 
 
 class ProcessManager:
@@ -134,24 +153,36 @@ class ProcessManager:
         """
         try:
             if os.path.exists(f"{self._config.data_path}/{id}/firecracker.pid"):
+                original_pid: Optional[int]
                 with open(f"{self._config.data_path}/{id}/firecracker.pid", "r") as f:
-                    original_pid = int(f.read().strip())
+                    try:
+                        original_pid = int(f.read().strip())
+                    except ValueError:
+                        # Unreadable PID file: search by socket path below.
+                        original_pid = None
 
-                try:
-                    # Try to stop using the PID from file
-                    if self._try_stop_process(original_pid, id):
-                        self._cleanup_files(id)
-                        return True
-                except ProcessError as e:
-                    if self._logger.verbose:
-                        self._logger.warn(
-                            f"Failed to stop Firecracker (1st attempt): {e}"
-                        )
+                # The PID file of a VM that died long ago can name a PID the
+                # kernel has since given to an unrelated process.
+                if original_pid is not None and self._is_vm_process(original_pid, id):
+                    try:
+                        # Try to stop using the PID from file
+                        if self._try_stop_process(original_pid, id):
+                            self._cleanup_files(id)
+                            return True
+                    except ProcessError as e:
+                        if self._logger.verbose:
+                            self._logger.warn(
+                                f"Failed to stop Firecracker (1st attempt): {e}"
+                            )
+                elif self._logger.verbose:
+                    self._logger.info(
+                        f"PID file of VM {id} does not name its Firecracker process, not stopping it"
+                    )
 
                 # If PID-based stop failed, search for actual running process
                 if self._logger.verbose:
                     self._logger.info(
-                        f"PID {original_pid} not found, searching for running Firecracker process for VM {id}"
+                        f"Searching for running Firecracker process for VM {id}"
                     )
 
                 actual_pid = self._find_running_process(id)
@@ -184,6 +215,10 @@ class ProcessManager:
             if self._logger.verbose:
                 self._logger.error(f"Error stopping Firecracker: {e}")
             raise ProcessError(f"Failed to stop Firecracker {id}: {str(e)}")
+
+    def _is_vm_process(self, pid: int, id: str) -> bool:
+        """Check that pid is the Firecracker process started for VM id."""
+        return is_vm_process(pid, id)
 
     def _try_stop_process(self, pid: int, id: str) -> bool:
         """Try to stop a specific process by PID.

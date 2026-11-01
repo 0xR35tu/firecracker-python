@@ -25,7 +25,7 @@ class TestNetworkErrorPaths:
     def test_delete_nat_rules_error(self, network_manager):
         """Test delete_nat_rules with error."""
         with patch.object(
-            network_manager, "get_nat_rules", side_effect=NetworkError("Failed")
+            network_manager, "get_filter_rules", side_effect=NetworkError("Failed")
         ):
             with pytest.raises(NetworkError, match="Failed to delete NAT rules"):
                 network_manager.delete_nat_rules("tap_test")
@@ -219,9 +219,7 @@ class TestNetworkEdgeCases:
 
     def test_check_tap_device_error(self, network_manager):
         """Test check_tap_device with error."""
-        with patch.object(
-            network_manager._ipr, "link_lookup", side_effect=Exception("Failed")
-        ):
+        with patch("firecracker.network.IPRoute", side_effect=Exception("Failed")):
             with pytest.raises(NetworkError, match="Failed to check tap device"):
                 network_manager.check_tap_device("test_tap")
 
@@ -259,8 +257,6 @@ class TestNetworkEdgeCases:
 
     def test_detect_cidr_conflict_error(self, network_manager):
         """Test detect_cidr_conflict with error."""
-        with patch.object(
-            network_manager._ipr, "get_links", side_effect=Exception("Failed")
-        ):
+        with patch("firecracker.network.IPRoute", side_effect=Exception("Failed")):
             with pytest.raises(NetworkError, match="Failed to check CIDR conflicts"):
                 network_manager.detect_cidr_conflict("172.16.0.10", 24)

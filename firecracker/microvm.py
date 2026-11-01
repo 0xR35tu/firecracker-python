@@ -16,7 +16,7 @@ from firecracker.api import Api
 from firecracker.logger import Logger
 from firecracker.network import NetworkManager
 from firecracker.process import ProcessManager
-from firecracker.vmm import VMMManager
+from firecracker.vmm import VMMManager, VMM_ID_PATTERN
 from firecracker.utils import (
     run,
     validate_ip_address,
@@ -227,6 +227,24 @@ class MicroVM:
 
         self._api = self._vmm.get_api(self._microvm_id)
 
+    def close(self):
+        """Release the API session, Docker client and network handles this
+        object holds.
+
+        Long-running callers that build a new MicroVM for each task should
+        call this, or use the object as a context manager.
+        """
+        self._api.close()
+        self._docker.close()
+        self._network.close()
+        self._vmm.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
     @staticmethod
     def list() -> List[Dict]:
         """List all running Firecracker VMs.
@@ -235,7 +253,10 @@ class MicroVM:
             List[Dict]: List of dictionaries containing VMM details
         """
         vmm_manager = VMMManager()
-        return vmm_manager.list_vmm()
+        try:
+            return vmm_manager.list_vmm()
+        finally:
+            vmm_manager.close()
 
     def find(self, state=None, labels=None):
         """Find a VMM by ID or labels.
@@ -533,12 +554,16 @@ class MicroVM:
         except Exception as e:
             raise VMMError(str(e))
 
-    def delete(self, id=None, all=False) -> str:
+    def delete(self, id=None, all=False, force=False) -> str:
         """Delete a specific VMM or all VMMs and clean up associated resources.
 
         Args:
             id (str, optional): The ID of the VMM to delete. If not provided, current VMM's ID is used.
             all (bool, optional): If True, delete all running VMMs. Defaults to False.
+            force (bool, optional): If True, clean up the VMM by ID even when its
+                process is not running, for example after a crash. Raises
+                VMMError if any cleanup step fails. Cannot be used with all.
+                Defaults to False.
 
         Returns:
             str: A status message indicating the result of the deletion operation.
@@ -546,6 +571,9 @@ class MicroVM:
         Raises:
             VMMError: If an error occurs during the deletion process.
         """
+        if force:
+            return self._force_delete(id or self._microvm_id, all)
+
         try:
             vmm_list = self._vmm.list_vmm()
             if not vmm_list:
@@ -573,6 +601,19 @@ class MicroVM:
         except Exception as e:
             self._logger.error(f"Error deleting VMM: {str(e)}")
             raise VMMError(str(e))
+
+    def _force_delete(self, id: str, all: bool) -> str:
+        """Clean up every resource of one VMM, whatever its process state."""
+        if all:
+            raise ValueError("force cannot be used with all")
+        if not VMM_ID_PATTERN.match(id or ""):
+            raise VMMError(f"Invalid VMM ID: {id!r}")
+
+        # Keep the shared masquerade rule: other VMs still use it.
+        errors = self._vmm.cleanup(id, delete_masquerade=False)
+        if errors:
+            raise VMMError(f"Cleanup of VMM {id} was incomplete: {'; '.join(errors)}")
+        return f"VMM {id} is deleted"
 
     def connect(self, id=None, username: str = None, key_path: str = None):
         """Connect to the microVM via SSH.

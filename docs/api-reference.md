@@ -244,7 +244,7 @@ Pauses or resumes the VM through the Firecracker API.
 
 **Returns:** `str`. `"VMM <id> paused successfully"` or `"VMM <id> resumed successfully"`.
 
-### `delete(id=None, all=False)`
+### `delete(id=None, all=False, force=False)`
 
 Stops the VM and removes its TAP device, nftables rules, port forwards and directory.
 
@@ -252,6 +252,7 @@ Stops the VM and removes its TAP device, nftables rules, port forwards and direc
 |---|---|
 | `id` | ID of the VM to delete. |
 | `all` | If `True`, delete every VM and clean up orphaned TAP devices. |
+| `force` | If `True`, clean up the VM even when its process is dead. Raises `VMMError` if a step fails. Cannot be used with `all`. See [Delete a VM whose process is dead](cleanup.md#delete-a-vm-whose-process-is-dead). |
 
 **Returns:** `str`. One of:
 
@@ -263,7 +264,21 @@ Stops the VM and removes its TAP device, nftables rules, port forwards and direc
 ```python
 MicroVM().delete(id="abcd1234")
 MicroVM().delete(all=True)
+MicroVM().delete(id="abcd1234", force=True)
 ```
+
+### `close()`
+
+Releases the API session and the Docker client that the object holds. A long-running program that makes a new `MicroVM` for each task must close each one.
+
+A `MicroVM` is also a context manager. It closes itself at the end of the `with` block:
+
+```python
+with MicroVM() as vm:
+    vm.delete(id="abcd1234", force=True)
+```
+
+`MicroVM.list()` closes its own resources. Call it on the class, not on a new object.
 
 ### `connect(id=None, username=None, key_path=None)`
 

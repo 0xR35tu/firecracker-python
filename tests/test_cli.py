@@ -89,14 +89,6 @@ def dead_pid():
     return proc.pid
 
 
-class FakeIPRoute:
-    def __init__(self, tap_names):
-        self._tap_names = list(tap_names)
-
-    def get_links(self):
-        return [{"ifname": name} for name in self._tap_names]
-
-
 class FakeNetworkManager:
     """Stand-in for firecracker.network.NetworkManager, no pyroute2/nftables needed."""
 
@@ -104,13 +96,13 @@ class FakeNetworkManager:
         self,
         tap_names=(),
         nftables_available=True,
-        nat_rules=None,
+        filter_rules=None,
         masquerade_handle=None,
         fail_steps=(),
     ):
-        self._ipr = FakeIPRoute(tap_names)
+        self._tap_names = list(tap_names)
         self._nftables_available = nftables_available
-        self._nat_rules = nat_rules or []
+        self._filter_rules = filter_rules or []
         self._masquerade_handle = masquerade_handle
         self._fail_steps = set(fail_steps)
         self.deleted_taps = []
@@ -123,8 +115,11 @@ class FakeNetworkManager:
     def is_nftables_available(self):
         return self._nftables_available
 
-    def get_nat_rules(self):
-        return self._nat_rules
+    def get_filter_rules(self):
+        return self._filter_rules
+
+    def get_links(self):
+        return [{"ifname": name} for name in self._tap_names]
 
     def get_masquerade_handle(self):
         return self._masquerade_handle
@@ -133,7 +128,7 @@ class FakeNetworkManager:
         return [r for r in rules if r.get("tap") == tap_name]
 
     def check_tap_device(self, name):
-        return name in self._ipr._tap_names
+        return name in self._tap_names
 
     def delete_tap(self, name):
         if "delete_tap" in self._fail_steps:
@@ -534,12 +529,9 @@ class TestHelpers:
         assert _human_size(None) == "-"
 
     def test_find_orphan_taps(self):
-        class FakeIPR:
+        class FakeNM:
             def get_links(self):
                 return [{"ifname": "tap_a1b2c3d4"}, {"ifname": "tap_zzzzzzzz"}, {"ifname": "eth0"}]
-
-        class FakeNM:
-            _ipr = FakeIPR()
 
         orphans = _find_orphan_taps(FakeNM(), {"a1b2c3d4": {}})
         assert orphans == ["tap_zzzzzzzz"]

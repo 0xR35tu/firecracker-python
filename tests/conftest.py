@@ -81,7 +81,7 @@ def mock_vm():
     Tests that need actual network operations should mark themselves with @pytest.mark.integration
     """
     with patch('firecracker.network.IPRoute'):
-        return MicroVM(kernel_file=KERNEL_FILE, base_rootfs=BASE_ROOTFS)
+        yield MicroVM(kernel_file=KERNEL_FILE, base_rootfs=BASE_ROOTFS)
 
 
 @pytest.fixture
@@ -92,7 +92,7 @@ def network_manager():
     Tests that need actual network operations should mark themselves with @pytest.mark.integration
     """
     with patch('firecracker.network.IPRoute'):
-        return NetworkManager()
+        yield NetworkManager()
 
 
 @pytest.fixture
@@ -103,7 +103,7 @@ def vmm_manager():
     Tests that need actual network operations should mark themselves with @pytest.mark.integration
     """
     with patch('firecracker.network.IPRoute'):
-        return VMMManager()
+        yield VMMManager()
 
 
 def generate_random_id(length=8):
@@ -117,20 +117,16 @@ def cleanup_network_resources():
     try:
         network = NetworkManager()
 
-        if network._ipr:
-            try:
-                links = network._ipr.get_links()
-                for link in links:
-                    ifname = link.get("ifname", "")
-                    if ifname.startswith("tap_"):
-                        try:
-                            idx = network._ipr.link_lookup(ifname=ifname)
-                            if idx:
-                                network._ipr.link("del", index=idx[0])
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+        try:
+            for link in network.get_links():
+                ifname = link.get("ifname", "")
+                if ifname.startswith("tap_"):
+                    try:
+                        network.delete_tap(ifname)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         if network._nft:
             try:

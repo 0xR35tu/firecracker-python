@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 import psutil
 
 from firecracker.config import MicroVMConfig
+from firecracker.process import is_vm_process
 
 VMM_ID_PATTERN = re.compile(r"^[a-zA-Z0-9]{8}$")
 EVENTS_FILENAME = "events.log"
@@ -79,24 +80,7 @@ def resolve_vm_id(vms: dict, query: str) -> str:
     return matches[0]
 
 
-def _is_vm_process(pid, vmm_id: str) -> bool:
-    """Return True only if pid is the Firecracker process for vmm_id.
-
-    A PID alone isn't enough: Linux recycles PIDs, so after a reboot or a
-    crash the same number can belong to an unrelated process (PID 1 is
-    always "alive," for instance). process.py always starts Firecracker
-    with `--id <vmm_id>`, so checking that flag in the process's own
-    cmdline is what actually proves it's this VM's process before we trust
-    it enough to kill it.
-    """
-    try:
-        cmdline = psutil.Process(int(pid)).cmdline()
-    except (TypeError, ValueError, psutil.Error):
-        return False
-    return any(
-        arg == "--id" and i + 1 < len(cmdline) and cmdline[i + 1] == vmm_id
-        for i, arg in enumerate(cmdline)
-    )
+_is_vm_process = is_vm_process
 
 
 def scan_vms(data_path: str) -> dict:
@@ -757,13 +741,13 @@ def cmd_net(args) -> int:
 
     try:
         nft_available = nm.is_nftables_available()
-        all_nat_rules = nm.get_nat_rules() if nft_available else []
+        all_filter_rules = nm.get_filter_rules() if nft_available else []
 
         report = []
         for vid in target_ids:
             tap_name = f"tap_{vid}"
             exists = nm.check_tap_device(tap_name)
-            rules = nm.find_tap_interface_rules(all_nat_rules, tap_name) if all_nat_rules else []
+            rules = nm.find_tap_interface_rules(all_filter_rules, tap_name) if all_filter_rules else []
             report.append({"id": vid, "tap": tap_name, "tap_exists": exists, "rules": rules})
 
         masquerade_handle = nm.get_masquerade_handle() if nft_available else None
@@ -913,7 +897,7 @@ def _find_orphan_taps(nm, vms: dict) -> list:
     if nm is None:
         return []
     try:
-        links = nm._ipr.get_links()
+        links = nm.get_links()
     except Exception:
         return []
 

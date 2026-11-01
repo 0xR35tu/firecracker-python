@@ -147,7 +147,7 @@ class TestOrphanedResourceCleanup:
             {"ifname": "eth0", "index": 1},  # Not a TAP device
         ]
 
-        with patch.object(network_manager._ipr, "get_links", return_value=mock_links):
+        with patch.object(network_manager, "get_links", return_value=mock_links):
             # Mock cleanup methods
             with patch.object(network_manager, "delete_nat_rules"):
                 with patch.object(network_manager, "delete_all_port_forward"):
@@ -175,7 +175,7 @@ class TestOrphanedResourceCleanup:
             {"ifname": "tap_vm2", "index": 11},
         ]
 
-        with patch.object(network_manager._ipr, "get_links", return_value=mock_links):
+        with patch.object(network_manager, "get_links", return_value=mock_links):
             with patch.object(network_manager, "delete_nat_rules"):
                 with patch.object(network_manager, "delete_all_port_forward"):
                     with patch.object(network_manager, "delete_tap") as mock_delete_tap:
@@ -190,7 +190,7 @@ class TestOrphanedResourceCleanup:
         running_vm_ids = set()
 
         # Mock get_links to return empty list
-        with patch.object(network_manager._ipr, "get_links", return_value=[]):
+        with patch.object(network_manager, "get_links", return_value=[]):
             # Call orphaned cleanup - should not raise error
             network_manager.cleanup_orphaned_tap_devices(running_vm_ids)
 
@@ -316,7 +316,7 @@ class TestCleanupIntegration:
         # Mock get_links to return orphaned TAP device
         mock_links = [{"ifname": "tap_orphan", "index": 12}]
 
-        with patch.object(network_manager._ipr, "get_links", return_value=mock_links):
+        with patch.object(network_manager, "get_links", return_value=mock_links):
             # Mock cleanup methods
             with patch.object(
                 network_manager, "delete_nat_rules"
